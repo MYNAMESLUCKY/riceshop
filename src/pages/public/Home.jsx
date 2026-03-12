@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { ChevronRight, ShoppingBag, Star, Search, Filter } from 'lucide-react';
-import { products as localProducts } from '../../data/products';
 import { fetchProducts } from '../../lib/db';
+import { products as localProducts } from '../../data/products';
 import { useCartStore } from '../../store/useCartStore';
 import toast from 'react-hot-toast';
 
@@ -16,7 +16,7 @@ const Hero = () => (
     <div className="container hero-grid">
       <div className="hero-content">
         <h1>Authentic <span>Premium Rice</span> for Every Cuisine</h1>
-        <p>Discover the finest selection of Basmati, Jasmine, and exotic grain varieties sourced from the world's most trusted farms.</p>
+        <p>Experience the finest selection of Basmati, Jasmine, and exotic grain varieties sourced directly from the world's most trusted farms.</p>
         <div className="hero-buttons">
           <a href="#products" className="btn btn-primary" style={{ textDecoration: 'none' }}>
             Explore Collection <ChevronRight size={18} />
@@ -26,8 +26,8 @@ const Hero = () => (
       <div className="hero-image-wrapper">
         <img
           className="hero-image"
-          src="https://images.unsplash.com/photo-1574316075902-692ab80126ff?q=80&w=1200&auto=format&fit=crop"
-          alt="Premium golden rice grains"
+          src="https://images.unsplash.com/photo-1586201375761-83865001e8ac?q=80&w=1200&auto=format&fit=crop"
+          alt="Premium golden rice grains floating in 3D"
         />
       </div>
     </div>
@@ -52,7 +52,10 @@ const ProductCard = ({ product }) => {
   
   const handleAdd = () => {
     addItem(product);
-    toast.success(`${product.name} added to cart!`, { icon: '🌾' });
+    toast.success(`${product.name} added to cart!`, { 
+      icon: '🌾',
+      style: { background: 'rgba(5, 5, 5, 0.9)', color: '#fff', border: '1px solid rgba(242, 204, 13, 0.3)', backdropFilter: 'blur(10px)' }
+    });
   };
 
   return (
@@ -65,7 +68,7 @@ const ProductCard = ({ product }) => {
         <div className="product-header">
           <span className="product-company">{product.company}</span>
           <div className="product-rating">
-            <Star size={14} fill="#fbbf24" color="#fbbf24" />
+            <Star size={14} fill="#f2cc0d" color="#f2cc0d" />
             {Number(product.rating).toFixed(1)}
           </div>
         </div>
@@ -74,10 +77,10 @@ const ProductCard = ({ product }) => {
         <div className="product-footer">
           <div>
             <div className="product-price">₹{Number(product.price).toFixed(2)}</div>
-            <div style={{ fontSize: '0.8rem', color: '#9ca3af' }}>per {product.weight}</div>
+            <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', fontWeight: 500, marginTop: '4px' }}>per {product.weight}</div>
           </div>
           <button className="add-btn" aria-label="Add to cart" onClick={handleAdd}>
-            <ShoppingBag size={18} />
+            <ShoppingBag size={20} />
           </button>
         </div>
       </div>
@@ -119,27 +122,28 @@ export const Home = () => {
       <Stats />
       <section id="products" className="products">
         <div className="container">
-          <h2 className="section-title">Exclusive Collection</h2>
-          <p className="section-subtitle">Handpicked selection of the highest quality rice varieties from renowned brands across the globe.</p>
+          <h2 className="section-title">Exclusive <span>Collection</span></h2>
+          <p className="section-subtitle" style={{marginBottom: '3rem'}}>
+            Handpicked selection of the highest quality rice varieties from renowned brands across the globe, tailored for culinary excellence.
+          </p>
 
           {/* Search + Filter */}
-          <div style={{ display: 'flex', gap: '1rem', marginBottom: '2.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
-            <div style={{ flex: 1, minWidth: '220px', position: 'relative' }}>
-              <Search size={18} style={{ position: 'absolute', left: '1rem', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-secondary)' }} />
+          <div className="filter-bar">
+            <div className="search-input-wrapper">
+              <Search size={20} style={{ position: 'absolute', left: '1.2rem', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-secondary)' }} />
               <input
                 type="text"
-                placeholder="Search rice or brand..."
+                placeholder="Search premium rice or brands..."
                 value={search}
                 onChange={e => setSearch(e.target.value)}
-                style={{ width: '100%', padding: '0.75rem 1rem 0.75rem 2.75rem', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: '50px', color: 'white', outline: 'none', fontSize: '0.95rem' }}
               />
             </div>
-            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+            <div className="filter-pills">
               {riceTypes.map(type => (
                 <button
                   key={type}
+                  className={`filter-pill ${activeType === type ? 'active' : ''}`}
                   onClick={() => setActiveType(type)}
-                  style={{ padding: '0.5rem 1.25rem', borderRadius: '50px', border: '1px solid', fontWeight: 600, cursor: 'pointer', fontSize: '0.85rem', transition: 'all 0.2s', background: activeType === type ? 'var(--primary)' : 'var(--surface)', color: activeType === type ? '#000' : 'var(--text-secondary)', borderColor: activeType === type ? 'var(--primary)' : 'var(--border)' }}
                 >
                   {type}
                 </button>
@@ -148,9 +152,16 @@ export const Home = () => {
           </div>
 
           {loading ? (
-            <div style={{ textAlign: 'center', padding: '4rem', color: 'var(--text-secondary)' }}>Loading premium grains...</div>
+            <div style={{ textAlign: 'center', padding: '6rem', color: 'var(--primary)' }}>
+              <div style={{ fontSize: '2rem', animation: 'float3D 2s infinite' }}>🌾</div>
+              <div style={{ marginTop: '1rem', letterSpacing: '2px', textTransform: 'uppercase', fontWeight: 600 }}>Loading Premium Grains...</div>
+            </div>
           ) : filtered.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: '4rem', color: 'var(--text-secondary)' }}>No products found.</div>
+            <div style={{ textAlign: 'center', padding: '6rem', color: 'var(--text-secondary)', background: 'var(--surface)', borderRadius: '24px', border: '1px solid var(--border)' }}>
+              <Search size={48} style={{ opacity: 0.3, marginBottom: '1rem' }} />
+              <h3>No products found matching your luxury taste.</h3>
+              <p style={{ marginTop: '0.5rem' }}>Try refining your search terms.</p>
+            </div>
           ) : (
             <div className="products-grid">
               {filtered.map(product => <ProductCard key={product.id} product={product} />)}

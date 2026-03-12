@@ -13,15 +13,30 @@ export const Login = () => {
   const [fullName, setFullName] = useState('');
   const [showPass, setShowPass] = useState(false);
   const [loading, setLoading] = useState(false);
+  const withTimeout = async (promise, ms = 15000) => {
+    let timerId;
+    const timeout = new Promise((_, reject) => {
+      timerId = setTimeout(() => reject(new Error('Sign in timed out. Please try again.')), ms);
+    });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      clearTimeout(timerId);
+    }
+  };
 
   const handleSignIn = async (e) => {
     e.preventDefault();
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!normalizedEmail) { toast.error('Email is required'); return; }
     setLoading(true);
     try {
-      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      const { data, error } = await withTimeout(
+        supabase.auth.signInWithPassword({ email: normalizedEmail, password })
+      );
       if (error) throw error;
       toast.success('Welcome back!');
-      navigate(isAdminEmail(data?.user?.email || email) ? '/admin' : '/');
+      navigate(isAdminEmail(data?.user?.email || normalizedEmail) ? '/admin' : '/');
     } catch (err) {
       toast.error(err.message || 'Sign in failed');
     } finally {
@@ -31,18 +46,29 @@ export const Login = () => {
 
   const handleSignUp = async (e) => {
     e.preventDefault();
+    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedFullName = fullName.trim();
+    if (!normalizedEmail) { toast.error('Email is required'); return; }
+    if (!normalizedFullName) { toast.error('Full name is required'); return; }
     if (password.length < 6) { toast.error('Password must be at least 6 characters'); return; }
     setLoading(true);
     try {
-      const { data, error } = await supabase.auth.signUp({ email, password });
+      const { data, error } = await supabase.auth.signUp({
+        email: normalizedEmail,
+        password,
+        options: {
+          data: { full_name: normalizedFullName },
+          emailRedirectTo: window.location.origin,
+        },
+      });
       if (error) throw error;
 
       // Create the profile record (silently log table missing error if DB isn't set up yet)
       if (data.user) {
-        const role = isAdminEmail(data.user.email || email) ? 'admin' : 'user';
+        const role = isAdminEmail(data.user.email || normalizedEmail) ? 'admin' : 'user';
         const { error: profileError } = await supabase.from('profiles').upsert({
           id: data.user.id,
-          full_name: fullName,
+          full_name: normalizedFullName,
           role,
         });
         if (profileError) {
@@ -85,7 +111,13 @@ export const Login = () => {
         </div>
 
         {/* Card */}
-        <div style={{ background: 'var(--surface)', padding: '2.5rem', borderRadius: '24px', border: '1px solid var(--border)', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)' }}>
+        <div style={{ 
+          background: 'linear-gradient(145deg, rgba(30,30,30,0.8) 0%, rgba(15,15,15,0.9) 100%)', 
+          padding: '2.5rem', 
+          borderRadius: '24px', 
+          border: '1px solid var(--border)', 
+          boxShadow: 'var(--shadow-3d), inset 0 1px 0 rgba(255,255,255,0.05)' 
+        }}>
 
           {/* Tab Toggle */}
           <div style={{ display: 'flex', background: 'var(--bg-color)', borderRadius: '12px', padding: '4px', marginBottom: '2rem' }}>

@@ -7,10 +7,30 @@ const buildFallbackProfile = (user, fallbackRole = 'user') => ({
   full_name: user?.user_metadata?.full_name || '',
 });
 
+const isMissingProfilesTableError = (error) => {
+  const message = error?.message || '';
+  return (
+    error?.code === 'PGRST205' ||
+    error?.code === '42P01' ||
+    /Could not find the table/i.test(message) ||
+    /relation .* does not exist/i.test(message)
+  );
+};
+
+let profilesTableMissing = false;
+let profilesMissingWarned = false;
+
 export const useAuthStore = create((set) => ({
   user: null,
   profile: null,
   loading: true,
+  setProfile: (profileUpdates) =>
+    set((state) => ({
+      profile: {
+        ...(state.profile || {}),
+        ...(profileUpdates || {}),
+      },
+    })),
 
   initialize: async () => {
     try {
@@ -28,10 +48,13 @@ export const useAuthStore = create((set) => ({
         set({ loading: false });
       }
 
-      supabase.auth.onAuthStateChange(async (_event, nextSession) => {
+      supabase.auth.onAuthStateChange((_event, nextSession) => {
         if (nextSession?.user) {
-          set({ user: nextSession.user });
-          await useAuthStore.getState().fetchProfile(nextSession.user.id);
+          set({ user: nextSession.user, loading: true });
+          // Avoid awaiting DB/auth calls inside Supabase auth callbacks to prevent sign-in deadlocks.
+          queueMicrotask(() => {
+            useAuthStore.getState().fetchProfile(nextSession.user.id);
+          });
         } else {
           set({ user: null, profile: null, loading: false });
         }
@@ -47,6 +70,11 @@ export const useAuthStore = create((set) => ({
       const {
         data: { user: authUser },
       } = await supabase.auth.getUser();
+
+      if (profilesTableMissing) {
+        set({ profile: buildFallbackProfile(authUser), loading: false });
+        return;
+      }
 
       const { data, error } = await supabase.from('profiles').select('*').eq('id', userId).single();
 
@@ -67,10 +95,20 @@ export const useAuthStore = create((set) => ({
         return;
       }
 
+      if (isMissingProfilesTableError(error)) {
+        profilesTableMissing = true;
+        if (!profilesMissingWarned) {
+          profilesMissingWarned = true;
+          console.warn('Profiles table missing. Run src/lib/database.sql in Supabase SQL Editor.');
+        }
+        set({ profile: buildFallbackProfile(authUser), loading: false });
+        return;
+      }
+
       if (error) throw error;
 
       const role = getEffectiveRole(authUser, data?.role);
-      const fullName = authUser?.user_metadata?.full_name || data?.full_name || '';
+      const fullName = data?.full_name || authUser?.user_metadata?.full_name || '';
       if (data?.role !== role) {
         const { error: syncRoleError } = await supabase.from('profiles').update({ role }).eq('id', userId);
 
@@ -81,6 +119,9 @@ export const useAuthStore = create((set) => ({
 
       set({ profile: { ...data, role, full_name: fullName }, loading: false });
     } catch (error) {
+      if (isMissingProfilesTableError(error)) {
+        profilesTableMissing = true;
+      }
       console.warn('Profile fetch skipped (DB tables might be missing):', error.message);
       const {
         data: { user },

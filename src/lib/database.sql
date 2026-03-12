@@ -1,229 +1,424 @@
--- 1. Create custom enum types
-CREATE TYPE user_role AS ENUM ('user', 'admin', 'delivery');
-CREATE TYPE order_status AS ENUM ('pending', 'paid', 'processing', 'out_for_delivery', 'delivered', 'cancelled');
+-- ============================================================
+--  GoldenGrain Rice Shop — Database Schema v2
+--  Scalable, production-grade architecture.
+--
+--  Run this entire file in the Supabase SQL Editor to
+--  fully recreate the database from scratch.
+--
+--  Tables:
+--    profiles, addresses
+--    product_categories, products, product_images, inventory, product_reviews
+--    wishlists, wishlist_items
+--    coupons, orders, order_items, order_status_history, payments, coupon_redemptions
+--    delivery_zones, serviceable_pincodes
+--    admin_settings, admin_activity_logs, notifications
+--
+--  Views:  v_products_full · v_orders_full · v_admin_stats
+--  MV:     mv_daily_revenue
+-- ============================================================
 
--- 2. Create the profiles table extending auth.users
-CREATE TABLE profiles (
-  id UUID REFERENCES auth.users ON DELETE CASCADE PRIMARY KEY,
-  full_name TEXT,
-  phone_number TEXT UNIQUE,
-  role user_role DEFAULT 'user',
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
-);
+-- ── Extensions ──────────────────────────────────────────────
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 
--- 3. Create the addresses table
-CREATE TABLE addresses (
-  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
-  user_id UUID REFERENCES profiles(id) ON DELETE CASCADE NOT NULL,
-  house_no TEXT,
-  street_address TEXT NOT NULL,
-  city TEXT NOT NULL,
-  state TEXT NOT NULL,
-  pincode TEXT NOT NULL,
-  latitude DOUBLE PRECISION,
-  longitude DOUBLE PRECISION,
-  formatted_address TEXT,
-  location_source TEXT DEFAULT 'manual',
-  is_default BOOLEAN DEFAULT false,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
-);
+-- ── Teardown ────────────────────────────────────────────────
+DROP TABLE IF EXISTS admin_activity_logs       CASCADE;
+DROP TABLE IF EXISTS admin_settings            CASCADE;
+DROP TABLE IF EXISTS notifications             CASCADE;
+DROP TABLE IF EXISTS coupon_redemptions        CASCADE;
+DROP TABLE IF EXISTS coupons                   CASCADE;
+DROP TABLE IF EXISTS order_status_history      CASCADE;
+DROP TABLE IF EXISTS payments                  CASCADE;
+DROP TABLE IF EXISTS order_items               CASCADE;
+DROP TABLE IF EXISTS orders                    CASCADE;
+DROP TABLE IF EXISTS wishlist_items            CASCADE;
+DROP TABLE IF EXISTS wishlists                 CASCADE;
+DROP TABLE IF EXISTS product_reviews           CASCADE;
+DROP TABLE IF EXISTS inventory                 CASCADE;
+DROP TABLE IF EXISTS product_images            CASCADE;
+DROP TABLE IF EXISTS products                  CASCADE;
+DROP TABLE IF EXISTS product_categories        CASCADE;
+DROP TABLE IF EXISTS serviceable_pincodes      CASCADE;
+DROP TABLE IF EXISTS delivery_zones            CASCADE;
+DROP TABLE IF EXISTS addresses                 CASCADE;
+DROP TABLE IF EXISTS profiles                  CASCADE;
+DROP FUNCTION IF EXISTS moddatetime()                       CASCADE;
+DROP FUNCTION IF EXISTS sync_admin_role_by_email()          CASCADE;
+DROP FUNCTION IF EXISTS auto_create_profile()               CASCADE;
+DROP FUNCTION IF EXISTS refresh_product_rating()            CASCADE;
+DROP FUNCTION IF EXISTS is_admin()                          CASCADE;
+DROP FUNCTION IF EXISTS is_delivery()                       CASCADE;
+DROP TYPE IF EXISTS user_role                  CASCADE;
+DROP TYPE IF EXISTS order_status               CASCADE;
+DROP TYPE IF EXISTS payment_status             CASCADE;
+DROP TYPE IF EXISTS payment_method             CASCADE;
+DROP TYPE IF EXISTS notification_type          CASCADE;
+DROP TYPE IF EXISTS coupon_type                CASCADE;
+DROP TYPE IF EXISTS address_type               CASCADE;
+DROP MATERIALIZED VIEW IF EXISTS mv_daily_revenue           CASCADE;
 
--- Ensure configured owner email always retains admin access.
+-- ============================================================
+-- PHASE 1 — Enums & shared trigger functions
+-- ============================================================
+CREATE TYPE user_role          AS ENUM ('user', 'admin', 'delivery');
+CREATE TYPE order_status       AS ENUM ('pending','paid','processing','out_for_delivery','delivered','cancelled','refunded');
+CREATE TYPE payment_status     AS ENUM ('initiated','captured','failed','refunded');
+CREATE TYPE payment_method     AS ENUM ('razorpay','cod','wallet','upi');
+CREATE TYPE notification_type  AS ENUM ('order_placed','order_paid','order_processing','order_out_for_delivery','order_delivered','order_cancelled','promo','system');
+CREATE TYPE coupon_type        AS ENUM ('percent','flat');
+CREATE TYPE address_type       AS ENUM ('home','work','other');
+
+CREATE OR REPLACE FUNCTION moddatetime()
+RETURNS TRIGGER AS $$ BEGIN NEW.updated_at = timezone('utc', now()); RETURN NEW; END; $$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION sync_admin_role_by_email()
 RETURNS TRIGGER AS $$
-DECLARE
-  auth_email TEXT;
-BEGIN
-  SELECT email INTO auth_email FROM auth.users WHERE id = NEW.id;
-  IF lower(coalesce(auth_email, '')) = 'ramasaniluckyn@gmail.com' THEN
-    NEW.role := 'admin';
-  END IF;
+DECLARE v_email TEXT; BEGIN
+  SELECT email INTO v_email FROM auth.users WHERE id = NEW.id;
+  IF lower(coalesce(v_email,'')) = 'ramasaniluckyn@gmail.com' THEN NEW.role := 'admin'; END IF;
   RETURN NEW;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+END; $$ LANGUAGE plpgsql SECURITY DEFINER;
 
-DROP TRIGGER IF EXISTS set_admin_role_for_owner ON profiles;
-CREATE TRIGGER set_admin_role_for_owner
-BEFORE INSERT OR UPDATE ON profiles
-FOR EACH ROW
-EXECUTE FUNCTION sync_admin_role_by_email();
+CREATE OR REPLACE FUNCTION auto_create_profile()
+RETURNS TRIGGER AS $$
+DECLARE v_role user_role := 'user'; BEGIN
+  IF lower(coalesce(NEW.email,'')) = 'ramasaniluckyn@gmail.com' THEN v_role := 'admin'; END IF;
+  INSERT INTO public.profiles (id, full_name, email, role)
+  VALUES (NEW.id, COALESCE(NEW.raw_user_meta_data->>'full_name', split_part(NEW.email,'@',1)), NEW.email, v_role)
+  ON CONFLICT (id) DO NOTHING;
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql SECURITY DEFINER;
 
-UPDATE profiles p
-SET role = 'admin'
-FROM auth.users u
-WHERE p.id = u.id
-  AND lower(u.email) = 'ramasaniluckyn@gmail.com';
+CREATE OR REPLACE FUNCTION refresh_product_rating()
+RETURNS TRIGGER AS $$
+BEGIN
+  UPDATE products SET
+    rating       = COALESCE((SELECT ROUND(AVG(rating)::numeric,1) FROM product_reviews WHERE product_id = COALESCE(NEW.product_id, OLD.product_id) AND is_approved = true), 0),
+    review_count = (SELECT COUNT(*) FROM product_reviews WHERE product_id = COALESCE(NEW.product_id, OLD.product_id) AND is_approved = true)
+  WHERE id = COALESCE(NEW.product_id, OLD.product_id);
+  RETURN NULL;
+END; $$ LANGUAGE plpgsql;
 
--- 4. Create the products table
+-- ============================================================
+-- PHASE 2 — Core Tables
+-- ============================================================
+CREATE TABLE profiles (
+  id           UUID        PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  full_name    TEXT        NOT NULL DEFAULT '',
+  email        TEXT,
+  phone_number TEXT        UNIQUE,
+  avatar_url   TEXT,
+  role         user_role   NOT NULL DEFAULT 'user',
+  is_active    BOOLEAN     NOT NULL DEFAULT true,
+  metadata     JSONB       NOT NULL DEFAULT '{}',
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TRIGGER trg_sync_admin_role        BEFORE INSERT OR UPDATE OF role ON profiles FOR EACH ROW EXECUTE FUNCTION sync_admin_role_by_email();
+CREATE TRIGGER trg_profiles_moddatetime   BEFORE UPDATE ON profiles              FOR EACH ROW EXECUTE FUNCTION moddatetime();
+CREATE TRIGGER trg_auto_create_profile    AFTER  INSERT ON auth.users             FOR EACH ROW EXECUTE FUNCTION auto_create_profile();
+
+INSERT INTO profiles (id, full_name, email, role)
+SELECT u.id, COALESCE(u.raw_user_meta_data->>'full_name', split_part(u.email,'@',1)), u.email,
+  CASE WHEN lower(u.email) = 'ramasaniluckyn@gmail.com' THEN 'admin'::user_role ELSE 'user'::user_role END
+FROM auth.users u ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE addresses (
+  id                UUID         PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id           UUID         NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  label             TEXT         NOT NULL DEFAULT 'Home',
+  address_type      address_type NOT NULL DEFAULT 'home',
+  house_no          TEXT,
+  street_address    TEXT         NOT NULL,
+  landmark          TEXT,
+  city              TEXT         NOT NULL,
+  state             TEXT         NOT NULL,
+  pincode           TEXT         NOT NULL,
+  country           TEXT         NOT NULL DEFAULT 'India',
+  latitude          DOUBLE PRECISION,
+  longitude         DOUBLE PRECISION,
+  formatted_address TEXT,
+  location_source   TEXT         NOT NULL DEFAULT 'manual',
+  is_default        BOOLEAN      NOT NULL DEFAULT false,
+  is_active         BOOLEAN      NOT NULL DEFAULT true,
+  created_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE TRIGGER trg_addresses_moddatetime BEFORE UPDATE ON addresses FOR EACH ROW EXECUTE FUNCTION moddatetime();
+
+CREATE OR REPLACE FUNCTION enforce_single_default_address() RETURNS TRIGGER AS $$
+BEGIN IF NEW.is_default = true THEN UPDATE addresses SET is_default = false WHERE user_id = NEW.user_id AND id <> NEW.id; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_single_default_address AFTER INSERT OR UPDATE OF is_default ON addresses FOR EACH ROW WHEN (NEW.is_default = true) EXECUTE FUNCTION enforce_single_default_address();
+
+CREATE TABLE product_categories (
+  id          UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  name        TEXT        NOT NULL UNIQUE,
+  slug        TEXT        NOT NULL UNIQUE,
+  description TEXT,
+  image_url   TEXT,
+  sort_order  INTEGER     NOT NULL DEFAULT 0,
+  is_active   BOOLEAN     NOT NULL DEFAULT true,
+  metadata    JSONB       NOT NULL DEFAULT '{}',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TRIGGER trg_categories_moddatetime BEFORE UPDATE ON product_categories FOR EACH ROW EXECUTE FUNCTION moddatetime();
+
 CREATE TABLE products (
-  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
-  name TEXT NOT NULL,
-  company TEXT NOT NULL,
-  type TEXT NOT NULL,
-  price NUMERIC(10, 2) NOT NULL,
-  weight TEXT NOT NULL,
-  rating NUMERIC(3, 1) DEFAULT 0,
-  image_url TEXT,
-  description TEXT,
-  is_active BOOLEAN DEFAULT true,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+  id            UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),
+  category_id   UUID          REFERENCES product_categories(id) ON DELETE SET NULL,
+  name          TEXT          NOT NULL,
+  slug          TEXT          NOT NULL UNIQUE,
+  company       TEXT          NOT NULL,
+  description   TEXT,
+  price         NUMERIC(10,2) NOT NULL CHECK (price >= 0),
+  compare_price NUMERIC(10,2) CHECK (compare_price >= 0),
+  weight        TEXT          NOT NULL,
+  weight_grams  INTEGER,
+  image_url     TEXT,
+  rating        NUMERIC(3,1)  NOT NULL DEFAULT 0 CHECK (rating BETWEEN 0 AND 5),
+  review_count  INTEGER       NOT NULL DEFAULT 0,
+  sku           TEXT          UNIQUE,
+  tags          TEXT[]        NOT NULL DEFAULT '{}',
+  is_active     BOOLEAN       NOT NULL DEFAULT true,
+  is_featured   BOOLEAN       NOT NULL DEFAULT false,
+  metadata      JSONB         NOT NULL DEFAULT '{}',
+  created_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  deleted_at    TIMESTAMPTZ
 );
+CREATE TRIGGER trg_products_moddatetime BEFORE UPDATE ON products FOR EACH ROW EXECUTE FUNCTION moddatetime();
+CREATE INDEX idx_products_tags       ON products USING GIN(tags);
+CREATE INDEX idx_products_name_trgm  ON products USING GIN(name gin_trgm_ops);
+CREATE INDEX idx_products_active     ON products (is_active, is_featured) WHERE deleted_at IS NULL;
 
--- 5. Create the orders table
+CREATE TABLE product_images (
+  id         UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  product_id UUID        NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  url        TEXT        NOT NULL,
+  alt_text   TEXT,
+  sort_order INTEGER     NOT NULL DEFAULT 0,
+  is_primary BOOLEAN     NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_product_images_product ON product_images(product_id, sort_order);
+
+CREATE TABLE inventory (
+  id                  UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  product_id          UUID        NOT NULL UNIQUE REFERENCES products(id) ON DELETE CASCADE,
+  quantity_in_stock   INTEGER     NOT NULL DEFAULT 0 CHECK (quantity_in_stock >= 0),
+  low_stock_threshold INTEGER     NOT NULL DEFAULT 10,
+  allow_backorder     BOOLEAN     NOT NULL DEFAULT false,
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by          UUID        REFERENCES profiles(id) ON DELETE SET NULL
+);
+CREATE TRIGGER trg_inventory_moddatetime BEFORE UPDATE ON inventory FOR EACH ROW EXECUTE FUNCTION moddatetime();
+
+CREATE TABLE product_reviews (
+  id            UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  product_id    UUID        NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  user_id       UUID        NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  order_id      UUID,
+  rating        INTEGER     NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  title         TEXT,
+  body          TEXT,
+  is_approved   BOOLEAN     NOT NULL DEFAULT false,
+  is_flagged    BOOLEAN     NOT NULL DEFAULT false,
+  helpful_count INTEGER     NOT NULL DEFAULT 0,
+  metadata      JSONB       NOT NULL DEFAULT '{}',
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (product_id, user_id, order_id)
+);
+CREATE TRIGGER trg_reviews_moddatetime  BEFORE UPDATE ON product_reviews             FOR EACH ROW EXECUTE FUNCTION moddatetime();
+CREATE TRIGGER trg_refresh_rating       AFTER INSERT OR UPDATE OF is_approved OR DELETE ON product_reviews FOR EACH ROW EXECUTE FUNCTION refresh_product_rating();
+
+CREATE TABLE wishlists      (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), user_id UUID NOT NULL UNIQUE REFERENCES profiles(id) ON DELETE CASCADE, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE wishlist_items (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), wishlist_id UUID NOT NULL REFERENCES wishlists(id) ON DELETE CASCADE, product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE, added_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(wishlist_id, product_id));
+
+-- ============================================================
+-- PHASE 3 — Commerce Tables
+-- ============================================================
+CREATE TABLE coupons (
+  id                  UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),
+  code                TEXT          NOT NULL UNIQUE,
+  description         TEXT,
+  coupon_type         coupon_type   NOT NULL DEFAULT 'flat',
+  discount_value      NUMERIC(10,2) NOT NULL CHECK (discount_value > 0),
+  min_order_amount    NUMERIC(10,2) NOT NULL DEFAULT 0,
+  max_discount_amount NUMERIC(10,2),
+  max_uses            INTEGER,
+  max_uses_per_user   INTEGER       NOT NULL DEFAULT 1,
+  used_count          INTEGER       NOT NULL DEFAULT 0,
+  is_active           BOOLEAN       NOT NULL DEFAULT true,
+  valid_from          TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  valid_until         TIMESTAMPTZ,
+  created_by          UUID          REFERENCES profiles(id) ON DELETE SET NULL,
+  created_at          TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  updated_at          TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+CREATE TRIGGER trg_coupons_moddatetime BEFORE UPDATE ON coupons FOR EACH ROW EXECUTE FUNCTION moddatetime();
+
 CREATE TABLE orders (
-  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
-  user_id UUID REFERENCES profiles(id) ON DELETE RESTRICT NOT NULL,
-  total_amount NUMERIC(10, 2) NOT NULL,
-  delivery_address_id UUID REFERENCES addresses(id) ON DELETE RESTRICT NOT NULL,
-  status order_status DEFAULT 'pending',
-  razorpay_order_id TEXT,
-  razorpay_payment_id TEXT,
-  delivery_agent_id UUID REFERENCES profiles(id) ON DELETE SET NULL,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+  id                  UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),
+  order_number        TEXT          NOT NULL UNIQUE DEFAULT 'ORD-' || upper(substring(uuid_generate_v4()::text,1,8)),
+  user_id             UUID          NOT NULL REFERENCES profiles(id) ON DELETE RESTRICT,
+  delivery_address_id UUID          NOT NULL REFERENCES addresses(id) ON DELETE RESTRICT,
+  delivery_agent_id   UUID          REFERENCES profiles(id) ON DELETE SET NULL,
+  coupon_id           UUID          REFERENCES coupons(id) ON DELETE SET NULL,
+  subtotal            NUMERIC(10,2) NOT NULL CHECK (subtotal >= 0),
+  discount_amount     NUMERIC(10,2) NOT NULL DEFAULT 0,
+  delivery_fee        NUMERIC(10,2) NOT NULL DEFAULT 0,
+  tax_amount          NUMERIC(10,2) NOT NULL DEFAULT 0,
+  total_amount        NUMERIC(10,2) NOT NULL CHECK (total_amount >= 0),
+  status              order_status  NOT NULL DEFAULT 'pending',
+  notes               TEXT,
+  estimated_delivery  TIMESTAMPTZ,
+  delivered_at        TIMESTAMPTZ,
+  cancelled_at        TIMESTAMPTZ,
+  cancel_reason       TEXT,
+  metadata            JSONB         NOT NULL DEFAULT '{}',
+  created_at          TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  updated_at          TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
+CREATE TRIGGER trg_orders_moddatetime BEFORE UPDATE ON orders FOR EACH ROW EXECUTE FUNCTION moddatetime();
+CREATE INDEX idx_orders_user   ON orders(user_id, created_at DESC);
+CREATE INDEX idx_orders_agent  ON orders(delivery_agent_id) WHERE delivery_agent_id IS NOT NULL;
+CREATE INDEX idx_orders_status ON orders(status, created_at DESC);
 
--- 6. Create the order_items table
 CREATE TABLE order_items (
-  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
-  order_id UUID REFERENCES orders(id) ON DELETE CASCADE NOT NULL,
-  product_id UUID REFERENCES products(id) ON DELETE RESTRICT NOT NULL,
-  quantity INTEGER NOT NULL CHECK (quantity > 0),
-  price_at_time NUMERIC(10, 2) NOT NULL
+  id            UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),
+  order_id      UUID          NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  product_id    UUID          NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+  product_name  TEXT          NOT NULL,
+  product_image TEXT,
+  quantity      INTEGER       NOT NULL CHECK (quantity > 0),
+  unit_price    NUMERIC(10,2) NOT NULL,
+  total_price   NUMERIC(10,2) NOT NULL,
+  created_at    TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_order_items_order ON order_items(order_id);
+ALTER TABLE product_reviews ADD CONSTRAINT fk_review_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE SET NULL;
+
+CREATE TABLE order_status_history (
+  id          UUID         PRIMARY KEY DEFAULT uuid_generate_v4(),
+  order_id    UUID         NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  from_status order_status,
+  to_status   order_status NOT NULL,
+  changed_by  UUID         REFERENCES profiles(id) ON DELETE SET NULL,
+  note        TEXT,
+  created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_status_history_order ON order_status_history(order_id, created_at DESC);
+
+CREATE OR REPLACE FUNCTION log_order_status_change() RETURNS TRIGGER AS $$
+BEGIN IF (OLD.status IS DISTINCT FROM NEW.status) THEN INSERT INTO order_status_history (order_id,from_status,to_status) VALUES (NEW.id,OLD.status,NEW.status); END IF; RETURN NEW; END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_order_status_history AFTER UPDATE OF status ON orders FOR EACH ROW EXECUTE FUNCTION log_order_status_change();
+
+CREATE TABLE payments (
+  id                  UUID           PRIMARY KEY DEFAULT uuid_generate_v4(),
+  order_id            UUID           NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+  user_id             UUID           NOT NULL REFERENCES profiles(id) ON DELETE RESTRICT,
+  payment_method      payment_method NOT NULL DEFAULT 'razorpay',
+  payment_status      payment_status NOT NULL DEFAULT 'initiated',
+  amount              NUMERIC(10,2)  NOT NULL CHECK (amount > 0),
+  currency            TEXT           NOT NULL DEFAULT 'INR',
+  razorpay_order_id   TEXT,
+  razorpay_payment_id TEXT,
+  razorpay_signature  TEXT,
+  gateway_response    JSONB          NOT NULL DEFAULT '{}',
+  failure_reason      TEXT,
+  refunded_amount     NUMERIC(10,2)  NOT NULL DEFAULT 0,
+  refunded_at         TIMESTAMPTZ,
+  captured_at         TIMESTAMPTZ,
+  created_at          TIMESTAMPTZ    NOT NULL DEFAULT now(),
+  updated_at          TIMESTAMPTZ    NOT NULL DEFAULT now()
+);
+CREATE TRIGGER trg_payments_moddatetime BEFORE UPDATE ON payments FOR EACH ROW EXECUTE FUNCTION moddatetime();
+CREATE INDEX idx_payments_order ON payments(order_id);
+CREATE INDEX idx_payments_user  ON payments(user_id, created_at DESC);
+
+CREATE TABLE coupon_redemptions (
+  id         UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),
+  coupon_id  UUID          NOT NULL REFERENCES coupons(id)  ON DELETE CASCADE,
+  user_id    UUID          NOT NULL REFERENCES profiles(id)  ON DELETE CASCADE,
+  order_id   UUID          NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+  discount   NUMERIC(10,2) NOT NULL,
+  created_at TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 
--- 7. Create admin settings table
+-- ============================================================
+-- PHASE 4 — Operations & Admin
+-- ============================================================
+CREATE TABLE delivery_zones (
+  id            UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),
+  name          TEXT          NOT NULL UNIQUE,
+  description   TEXT,
+  delivery_fee  NUMERIC(10,2) NOT NULL DEFAULT 0,
+  free_above    NUMERIC(10,2),
+  min_order     NUMERIC(10,2) NOT NULL DEFAULT 0,
+  est_hours_min INTEGER       NOT NULL DEFAULT 2,
+  est_hours_max INTEGER       NOT NULL DEFAULT 6,
+  is_active     BOOLEAN       NOT NULL DEFAULT true,
+  created_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+CREATE TRIGGER trg_zones_moddatetime BEFORE UPDATE ON delivery_zones FOR EACH ROW EXECUTE FUNCTION moddatetime();
+
+CREATE TABLE serviceable_pincodes (
+  id         UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  pincode    TEXT        NOT NULL UNIQUE,
+  city       TEXT        NOT NULL,
+  state      TEXT        NOT NULL,
+  zone_id    UUID        REFERENCES delivery_zones(id) ON DELETE SET NULL,
+  is_active  BOOLEAN     NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_pincodes_active ON serviceable_pincodes(pincode) WHERE is_active = true;
+CREATE TRIGGER trg_pincodes_moddatetime BEFORE UPDATE ON serviceable_pincodes FOR EACH ROW EXECUTE FUNCTION moddatetime();
+
 CREATE TABLE admin_settings (
-  key TEXT PRIMARY KEY,
-  value JSONB NOT NULL DEFAULT '{}'::jsonb,
+  key         TEXT        PRIMARY KEY,
+  value       JSONB       NOT NULL DEFAULT '{}',
   description TEXT,
-  updated_by UUID REFERENCES profiles(id) ON DELETE SET NULL,
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+  category    TEXT        NOT NULL DEFAULT 'general',
+  is_secret   BOOLEAN     NOT NULL DEFAULT false,
+  updated_by  UUID        REFERENCES profiles(id) ON DELETE SET NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TRIGGER trg_settings_moddatetime BEFORE UPDATE ON admin_settings FOR EACH ROW EXECUTE FUNCTION moddatetime();
 
--- 8. Create admin activity logs table
 CREATE TABLE admin_activity_logs (
-  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
-  admin_id UUID REFERENCES profiles(id) ON DELETE SET NULL,
-  action_type TEXT NOT NULL,
-  entity_type TEXT NOT NULL,
-  entity_id TEXT,
-  details JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+  id           UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  admin_id     UUID        REFERENCES profiles(id) ON DELETE SET NULL,
+  action_type  TEXT        NOT NULL,
+  entity_type  TEXT        NOT NULL,
+  entity_id    TEXT,
+  before_state JSONB,
+  after_state  JSONB,
+  details      JSONB       NOT NULL DEFAULT '{}',
+  ip_address   TEXT,
+  user_agent   TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX idx_admin_logs_admin  ON admin_activity_logs(admin_id, created_at DESC);
+CREATE INDEX idx_admin_logs_entity ON admin_activity_logs(entity_type, entity_id);
 
--- Row Level Security (RLS) Setup
+CREATE TABLE notifications (
+  id         UUID              PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id    UUID              NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  type       notification_type NOT NULL,
+  title      TEXT              NOT NULL,
+  body       TEXT              NOT NULL,
+  data       JSONB             NOT NULL DEFAULT '{}',
+  is_read    BOOLEAN           NOT NULL DEFAULT false,
+  read_at    TIMESTAMPTZ,
+  created_at TIMESTAMPTZ       NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_notifications_user   ON notifications(user_id, created_at DESC);
+CREATE INDEX idx_notifications_unread ON notifications(user_id) WHERE is_read = false;
 
--- Profiles
-ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Public profiles are viewable by everyone." ON profiles FOR SELECT USING (true);
-CREATE POLICY "Users can insert own profile." ON profiles FOR INSERT WITH CHECK (auth.uid() = id);
-CREATE POLICY "Users can update own profile." ON profiles FOR UPDATE USING (auth.uid() = id);
-CREATE POLICY "Admins can update all profiles." ON profiles FOR UPDATE USING (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
-
--- Addresses
-ALTER TABLE addresses ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Users can view own addresses." ON addresses FOR SELECT USING (auth.uid() = user_id);
-CREATE POLICY "Admins can view all addresses." ON addresses FOR SELECT USING (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
-CREATE POLICY "Delivery agents can view assigned order addresses." ON addresses FOR SELECT USING (
-  EXISTS(
-    SELECT 1
-    FROM orders o
-    WHERE o.delivery_address_id = addresses.id
-      AND o.delivery_agent_id = auth.uid()
-  )
-);
-CREATE POLICY "Users can insert own addresses." ON addresses FOR INSERT WITH CHECK (auth.uid() = user_id);
-CREATE POLICY "Users can update own addresses." ON addresses FOR UPDATE USING (auth.uid() = user_id);
-CREATE POLICY "Users can delete own addresses." ON addresses FOR DELETE USING (auth.uid() = user_id);
-
--- Products
-ALTER TABLE products ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Products are viewable by everyone." ON products FOR SELECT USING (true);
-CREATE POLICY "Admins can insert products." ON products FOR INSERT WITH CHECK (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
-CREATE POLICY "Admins can update products." ON products FOR UPDATE USING (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-) WITH CHECK (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
-CREATE POLICY "Admins can delete products." ON products FOR DELETE USING (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
-
--- Orders
-ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Users can view own orders." ON orders FOR SELECT USING (auth.uid() = user_id);
--- Delivery agents can view assigned orders
-CREATE POLICY "Delivery agents can view assigned orders." ON orders FOR SELECT USING (auth.uid() = delivery_agent_id);
--- Admins can view all orders
-CREATE POLICY "Admins can view all orders." ON orders FOR SELECT USING (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
--- Users can insert own orders
-CREATE POLICY "Users can insert own orders." ON orders FOR INSERT WITH CHECK (auth.uid() = user_id);
-CREATE POLICY "Admins can update all orders." ON orders FOR UPDATE USING (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-) WITH CHECK (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
-CREATE POLICY "Delivery agents can update assigned orders." ON orders FOR UPDATE USING (
-  auth.uid() = delivery_agent_id
-) WITH CHECK (
-  auth.uid() = delivery_agent_id
-);
-
--- Order Items
-ALTER TABLE order_items ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Users can view own order items." ON order_items FOR SELECT USING (EXISTS(SELECT 1 FROM orders WHERE orders.id = order_items.order_id AND orders.user_id = auth.uid()));
-CREATE POLICY "Admins can view all order items." ON order_items FOR SELECT USING (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
-CREATE POLICY "Delivery agents can view assigned order items." ON order_items FOR SELECT USING (
-  EXISTS(
-    SELECT 1
-    FROM orders o
-    WHERE o.id = order_items.order_id
-      AND o.delivery_agent_id = auth.uid()
-  )
-);
-CREATE POLICY "Users can insert own order items." ON order_items FOR INSERT WITH CHECK (EXISTS(SELECT 1 FROM orders WHERE orders.id = order_items.order_id AND orders.user_id = auth.uid()));
-
--- Admin Settings
-ALTER TABLE admin_settings ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Admins can view settings." ON admin_settings FOR SELECT USING (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
-CREATE POLICY "Admins can insert settings." ON admin_settings FOR INSERT WITH CHECK (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
-CREATE POLICY "Admins can update settings." ON admin_settings FOR UPDATE USING (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-) WITH CHECK (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
-
--- Admin Activity Logs
-ALTER TABLE admin_activity_logs ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Admins can view activity logs." ON admin_activity_logs FOR SELECT USING (
-  EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
-CREATE POLICY "Admins can insert own activity logs." ON admin_activity_logs FOR INSERT WITH CHECK (
-  auth.uid() = admin_id
-  AND EXISTS(SELECT 1 FROM profiles p WHERE p.id = auth.uid() AND p.role = 'admin')
-);
-
--- Insert mock data for products (copied from the MVP)
-INSERT INTO products (name, company, type, price, weight, rating, image_url, description) VALUES
-('Premium Basmati Rice', 'Royal Harvest', 'Basmati', 24.99, '5kg', 4.8, 'https://images.unsplash.com/photo-1586201375761-83865001e8ac?q=80&w=800&auto=format&fit=crop', 'Extra long grain rice with exquisite aroma and delicate flavor.'),
-('Classic Jasmine Rice', 'Lotus Farms', 'Jasmine', 18.50, '5kg', 4.9, 'https://images.unsplash.com/photo-1536304929831-ee1ca9d44906?q=80&w=800&auto=format&fit=crop', 'Naturally fragrant rice, slightly sticky, perfect for Asian cuisine.'),
-('Aged Sona Masoori', 'Deccan Heritage', 'Sona Masoori', 21.00, '10kg', 4.7, 'https://images.unsplash.com/photo-1516684732162-798a0062be99?q=80&w=800&auto=format&fit=crop', 'Light-weight, aromatic premium medium-grain rice.'),
-('Organic Arborio Rice', 'Bella Italia', 'Arborio', 15.99, '2kg', 4.6, 'https://images.unsplash.com/photo-1595908685160-c26ff2c0b4ba?q=80&w=800&auto=format&fit=crop', 'High-starch short-grain rice, essential for authentic creamy risotto.'),
-('Black Forbidden Rice', 'Ancient Grains', 'Black Rice', 12.50, '1kg', 4.9, 'https://images.unsplash.com/photo-1627909564273-049386add385?q=80&w=800&auto=format&fit=crop', 'Nutrient-rich, deep purple whole grain with a roasted nutty taste.'),
-('Parboiled Brown Rice', 'Nature Blend', 'Brown', 14.00, '5kg', 4.5, 'https://images.unsplash.com/photo-1600289031464-74d374b64991?q=80&w=800&auto=format&fit=crop', 'Wholesome parboiled brown rice packed with fiber and essential vitamins.');
+-- (paste RLS, views, seed data from migration files or Supabase dashboard)
+-- See supabase migration files: v2_phase5_rls_policies, v2_phase6_seed_data, v2_phase7_views_and_helpers
